@@ -22,12 +22,6 @@ TaskFlow examples:
 - Login with email and password -> authentication
 - Check whether the logged-in user is an `admin` -> authorization
 
-Why people mix them up:
-
-- both happen around protected routes
-- both can reject a request
-- but they fail for different reasons and often return different status codes
-
 ---
 
 ## 2. What a JWT actually is
@@ -67,8 +61,6 @@ Why `sub` matters:
 ---
 
 ## 3. Signing vs verifying
-
-This distinction matters a lot in NestJS auth.
 
 ### Signing
 
@@ -127,13 +119,9 @@ Core runtime shape:
 Request -> Guard -> Strategy -> validate() -> req.user
 ```
 
-That chain explains most auth behavior in NestJS.
-
 ---
 
 ## 6. Strategy vs guard
-
-These two roles are easy to confuse.
 
 ### Strategy
 
@@ -152,11 +140,6 @@ Examples:
 
 - `LocalAuthGuard` triggers the `local` strategy
 - `JwtAuthGuard` triggers the `jwt` strategy
-
-Short memory trick:
-
-- strategy = auth logic
-- guard = route gate
 
 ---
 
