@@ -100,6 +100,55 @@ The 100 successful requests each enqueue a job immediately and return `202 Proce
 
 > These 100 users all received an HTTP response like `{ "status": "processing", "jobId": "job-001" }` immediately — they are not waiting on a DB transaction. The `attempts: 3` means BullMQ will retry each job up to 3 times on failure before marking it dead.
 
+### Where Does BullMQ Job Data Actually Live?
+
+**BullMQ stores everything in Redis** — not in PostgreSQL. It uses namespaced Redis keys under the queue name alongside your inventory counter.
+
+> **You never write these Redis keys manually.** BullMQ manages them entirely through its abstraction. Your code only calls `saleQueue.add(...)` to enqueue and `process(job)` to consume — BullMQ handles all the Redis operations internally. The table below shows what BullMQ is doing under the hood, not what you implement.
+
+**Redis keys BullMQ creates and manages automatically:**
+
+| Redis Key | Type | What it stores | Created by |
+|---|---|---|---|
+| `bull:flash-sale:{jobId}` | Hash | Full job payload (`itemId`, `userId`, `attemptsMade`, `opts`, timestamps) | `saleQueue.add()` |
+| `bull:flash-sale:wait` | List | Job IDs waiting to be picked up by a worker | `saleQueue.add()` |
+| `bull:flash-sale:active` | List | Job IDs currently being processed by a worker | BullMQ worker internals |
+| `bull:flash-sale:failed` | Sorted Set | Job IDs that failed all attempts (score = timestamp) | BullMQ worker internals |
+| `bull:flash-sale:completed` | Sorted Set | Job IDs that succeeded (empty here — `removeOnComplete: true`) | BullMQ worker internals |
+| `bull:flash-sale:delayed` | Sorted Set | Job IDs in backoff delay before retry (score = when to retry) | BullMQ worker internals |
+
+**What your code actually writes vs what BullMQ writes:**
+
+```typescript
+// YOUR code — this is all you write:
+await this.saleQueue.add('process-purchase', { itemId, userId });
+
+// BULLMQ internally runs (you never write this):
+// HSET bull:flash-sale:job-001 { itemId, userId, attemptsMade: 0, ... }
+// LPUSH bull:flash-sale:wait "job-001"
+```
+
+```typescript
+// YOUR code — the consumer method signature:
+async process(job: Job): Promise<void> {
+  // method returns normally  → BullMQ moves job from :active → removed (or :completed)
+  // method throws            → BullMQ moves job from :active → :delayed (retry) or :failed
+}
+
+// BULLMQ internally handles the key transitions — you never touch them
+```
+
+**Redis while the first batch of 5 jobs is being processed:**
+
+| Key | Type | Value |
+|-----|------|-------|
+| `sale:inventory:42` | String | `0` |
+| `bull:flash-sale:wait` | List | `["job-006", "job-007", ..., "job-100"]` (95 remaining) |
+| `bull:flash-sale:active` | List | `["job-001", "job-002", "job-003", "job-004", "job-005"]` |
+| `bull:flash-sale:job-001` | Hash | `{ itemId: 42, userId: 1001, attemptsMade: 0, ... }` |
+
+> BullMQ shares the same Redis instance as your `sale:inventory:42` counter. On a high-traffic system, give BullMQ a **dedicated Redis instance** or at minimum ensure `maxmemory-policy noeviction` — BullMQ memory pressure must not evict your inventory key mid-sale.
+
 **`items` table** — still unchanged. DB has not been touched yet.
 
 | id | name | stock |
@@ -228,6 +277,104 @@ await this.releaseRedisInventory(itemId);
 | `sale:inventory:42` | `5` |
 
 > The unit is returned to the Redis pool so the next queued request can claim it. Without this `INCR`, the Redis counter would permanently under-count, and one unit would go unsold even though the DB still has it.
+
+---
+
+## Stage 7b — Job Fails All 3 Attempts
+
+User 1050 passed the Redis gate (DECR returned 5). Their job is enqueued. The DB write fails on all 3 attempts (e.g. DB is temporarily unavailable).
+
+### The Bug in the Naive Implementation
+
+The catch block in the consumer calls `releaseRedisInventory` (INCR) and rethrows on **every** failure:
+
+```typescript
+catch (error) {
+  await this.releaseRedisInventory(itemId); // ← called on EVERY attempt ← BUG
+  throw error; // BullMQ retries
+}
+```
+
+**What actually happens across all 3 attempts:**
+
+| Attempt | DB write | catch runs | Redis INCR fired | Redis counter after |
+|---------|----------|------------|-----------------|---------------------|
+| 1 (fails) | ❌ | ✅ | ✅ | 4 → **5** |
+| 2 (fails) | ❌ | ✅ | ✅ | 5 → **6** |
+| 3 (fails) | ❌ | ✅ | ✅ | 6 → **7** |
+
+The unit is restored **3 times** instead of once. Redis now thinks 7 units are available when only 5 actually are — 3 extra phantom units are visible to the gate. Three other users could claim units that don't exist in the DB, and would only be rejected later at the `WHERE stock > 0` layer. The user also receives 3 "Order could not be processed" notifications.
+
+**Redis after all 3 attempts (buggy version):**
+
+| Key | Value | Expected |
+|-----|-------|----------|
+| `sale:inventory:42` | `7` | should be `5` |
+
+---
+
+### The Fix — Only Release on the Final Attempt
+
+```typescript
+catch (error) {
+  const isLastAttempt = job.attemptsMade >= job.opts.attempts - 1;
+
+  if (isLastAttempt) {
+    await this.releaseRedisInventory(itemId); // INCR once, on permanent failure only
+    await this.notificationsService.notifyUser(userId, 'Order could not be processed');
+  }
+
+  throw error;
+}
+```
+
+**What happens across all 3 attempts with the fix:**
+
+| Attempt | DB write | `isLastAttempt` | Redis INCR fired | User notified |
+|---------|----------|-----------------|-----------------|---------------|
+| 1 (fails) | ❌ | false | ❌ | ❌ |
+| 2 (fails) | ❌ | false | ❌ | ❌ |
+| 3 (fails) | ❌ | **true** | ✅ (once) | ✅ (once) |
+
+**Redis after all 3 attempts (fixed version):**
+
+| Key | Value |
+|-----|-------|
+| `sale:inventory:42` | `5` (correctly restored by 1) |
+
+**BullMQ Redis after final failure:**
+
+| Key | Value |
+|-----|-------|
+| `bull:flash-sale:failed` | `["job-1050"]` (kept for inspection — `removeOnFail: false`) |
+| `bull:flash-sale:job-1050` | `{ itemId: 42, userId: 1050, attemptsMade: 3, failedReason: "..." }` |
+
+**`orders` table** — no row created for user 1050:
+
+| id | item_id | user_id | status |
+|----|---------|---------|--------|
+| ord-001 | 42 | 1001 | confirmed |
+| ... | | | |
+| _(no row for user 1050)_ | | | |
+
+**`items` table** — stock unchanged from what it was (DB write never succeeded):
+
+| id | name | stock |
+|----|------|-------|
+| 42 | Limited Edition Sneakers | 5 (unaffected by the failed job) |
+
+> The DB was never touched by the failing job — `UPDATE WHERE stock > 0` either succeeds fully or not at all (it runs inside a transaction). Since the job never got past the DB error, `stock` was never decremented.
+
+### Final Outcome Comparison
+
+| Scenario | Redis counter | DB stock | Item sold? |
+|---|---|---|---|
+| Job succeeds | decremented | decremented | ✅ Sold |
+| Job fails 3×, `INCR` on final only (fix) | **restored by 1** | unchanged | ⚠️ Unit back in pool |
+| Job fails 3×, `INCR` on every attempt (bug) | **restored 3×** | unchanged | ❌ 3 phantom units injected |
+| Job fails 3×, no `INCR` at all | unchanged (under-counted) | unchanged | ❌ Ghost-claimed — unsold forever |
+
+> The `syncInventoryFromDatabase()` function is also a recovery tool for the ghost-claimed case — it re-seeds Redis from the DB's actual `stock` value when the key is missing or drifted.
 
 ---
 

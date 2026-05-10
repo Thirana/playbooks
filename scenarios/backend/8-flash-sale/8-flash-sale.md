@@ -204,26 +204,44 @@ export class PurchaseConsumer extends WorkerHost {
   }
 
   async process(job: Job): Promise<void> {
-    const { itemId, userId, redisClaimId } = job.data;
+    const { itemId, userId } = job.data;
 
     try {
       await this.confirmPurchaseInDatabase(itemId, userId);
-      // Notify user: order confirmed
       await this.notificationsService.notifyUser(userId, "Order confirmed!");
     } catch (error) {
-      // DB write failed — release the Redis inventory reservation
-      // so the unit becomes available to the next person in queue
-      await this.releaseRedisInventory(itemId);
-      // Notify user: order failed
-      await this.notificationsService.notifyUser(
-        userId,
-        "Order could not be processed",
-      );
-      throw error; // BullMQ will retry based on the attempts config
+      // Only release the Redis inventory unit and notify the user on the
+      // FINAL attempt. If you call INCR on every attempt, the unit gets
+      // restored multiple times — injecting phantom inventory into the gate.
+      const isLastAttempt = job.attemptsMade >= job.opts.attempts - 1;
+
+      if (isLastAttempt) {
+        // Put the unit back so another user can claim it
+        await this.releaseRedisInventory(itemId);
+        // Notify the user once — not on every retry
+        await this.notificationsService.notifyUser(userId, "Order could not be processed");
+      }
+
+      throw error; // BullMQ retries until attemptsMade === attempts
     }
   }
 }
 ```
+
+**Where does BullMQ job data live?**
+
+BullMQ stores all job data in **Redis**, not PostgreSQL. It uses a set of namespaced keys alongside your inventory counter:
+
+| Redis Key | Type | Contains |
+|---|---|---|
+| `bull:flash-sale:{jobId}` | Hash | Job payload, `attemptsMade`, timestamps |
+| `bull:flash-sale:wait` | List | IDs of jobs waiting to be picked up |
+| `bull:flash-sale:active` | List | IDs of jobs currently running |
+| `bull:flash-sale:delayed` | Sorted Set | IDs in exponential backoff before retry |
+| `bull:flash-sale:failed` | Sorted Set | IDs of jobs that exhausted all attempts |
+| `bull:flash-sale:completed` | Sorted Set | IDs of succeeded jobs (empty — `removeOnComplete: true`) |
+
+> Because BullMQ shares the same Redis instance as `sale:inventory:42`, its memory usage can trigger key eviction if `maxmemory-policy` is not set to `noeviction`. Use a **dedicated Redis instance for BullMQ** on high-traffic sales, or at minimum protect the inventory key from eviction.
 
 #### Layer 3 — Atomic Database Write
 
