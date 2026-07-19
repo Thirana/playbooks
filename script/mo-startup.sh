@@ -27,7 +27,7 @@ start_typesense() {
     -v "${data_dir}:/data" \
     "$image" \
     --data-dir /data \
-    --api-key=07bac18f-bf41-42a8-a3dd-94a4ea098a3f \
+    --api-key=<> \
     --enable-cors
 
   echo "Typesense container started."
