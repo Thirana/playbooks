@@ -1,8 +1,8 @@
 # NestJS DI, Modules & Scopes (Reference Note)
 
-> How the app is wired and how instance lifetimes work. Built bottom-up — each section assumes the one above. Long-form lessons: `02a-nestjs-di-wiring.md`, `02b-nestjs-di-scopes-deep.md`.
+> How the app is wired and how instance lifetimes work. Built bottom-up — each section assumes the one above. Long-form lessons: `01-di-wiring.md`, `02-nestjs-di-scopes.md`, `03-container-vs-bootstrap.md`.
 >
-> **The build:** the problem DI solves → IoC → container → providers & tokens → modules (visibility) → dynamic modules → scopes → the singleton+interleaving leak → REQUEST bubbling → ALS.
+> **The build:** the problem DI solves → IoC → container → providers & tokens → modules (visibility) → dynamic modules → container vs bootstrap (`main.ts`) → scopes → the singleton+interleaving leak → REQUEST bubbling → ALS.
 
 ---
 
@@ -12,7 +12,8 @@
 - **The container resolves a graph:** you declare edges (constructor params), it builds everything in order and hands you a finished object — once, at boot, for singletons.
 - **A provider = *token → recipe*.** Token = lookup key; recipe = how to build it.
 - **Modules are the encapsulation boundary:** `providers` = what I own, `exports` = what I share, `imports` = whose sharing I consume.
-- **Default provider = one shared singleton for the app's life.** Great for stateless; unsafe for per-request state (see §7).
+- **Default provider = one shared singleton for the app's life.** Great for stateless; unsafe for per-request state (see §8).
+- **A Module *declares* what exists; `main.ts` *configures* the built app.** `NestFactory.create()` is the dividing line — before it, only declarations; after it, imperative calls on the finished `app`.
 - **`await` interleaves requests** → a singleton field can hold the wrong request's data. Isolation needs scopes or ALS.
 
 ---
@@ -124,7 +125,34 @@ RabbitModule.forRootAsync({
 
 ---
 
-## 6. Scopes: the three lifetimes
+## 6. Container vs bootstrap (modules declare · `main.ts` configures)
+
+`NestFactory.create(AppModule)` is the dividing line. **Before it:** modules are just declarations — nothing is built. **After it:** everything is imperative method calls on the one finished `app` object.
+
+```ts
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule, { bufferLogs: true }); // 1. build the container
+  app.useLogger(app.get(Logger));                                        // 2. configure the built app
+  app.setGlobalPrefix('api');
+  await app.listen(process.env.PORT ?? 8080);                            // 3. accept traffic
+}
+```
+
+| | Modules (`AppModule`, …) | `main.ts` (bootstrap) |
+|---|---|---|
+| What it is | **Declaration** — providers/controllers exist & connect | **Imperative setup** on the already-built `app` |
+| When | during `NestFactory.create()`, as the graph resolves | after the graph exists, around `app.listen()` |
+| Injectable? | yes — the whole point | no — outermost layer, nothing to inject it into |
+
+- **Rule of thumb:** *what exists / how it connects* → module job. *how the assembled app instance behaves* → `main.ts` job (`useLogger`, `setGlobalPrefix`, `listen` — no `@Module` option for these).
+- **`app.get(Token)` is the seam:** bootstrap reaching into the finished container to grab something the modules built.
+- **Two registrations, two jobs (logger example):** `LoggerModule.forRoot(opts)` makes the Pino-backed `Logger` provider *exist* and wires `pino-http` middleware; `app.useLogger(app.get(Logger))` then redirects Nest's *core* logging and every `new Logger(ctx)` call site to it. Neither can do the other's job — drop the module and `app.get()` throws; drop the `main.ts` call and core keeps the default logger.
+- **`bufferLogs: true`** holds logs produced while the container is still building until `useLogger` flips the switch, then flushes them through the chosen logger.
+- **Same fork for any global:** `APP_GUARD` provider in a module (container-built, full DI) vs `app.useGlobalGuards(new X())` in bootstrap (hand-built, no DI).
+
+---
+
+## 7. Scopes: the three lifetimes
 
 ```ts
 @Injectable()                            // DEFAULT  — singleton (built once)
@@ -134,7 +162,7 @@ RabbitModule.forRootAsync({
 
 ---
 
-## 7. The leak that forces scopes
+## 8. The leak that forces scopes
 
 ```ts
 // ❌ singleton field + request interleaving = cross-request data leak
@@ -150,7 +178,7 @@ A.setUser('alice') → await (A parks) → B.setUser('bob') → A resumes getUse
 
 ---
 
-## 8. REQUEST scope: what it buys, what it costs
+## 9. REQUEST scope: what it buys, what it costs
 
 ```ts
 @Injectable({ scope: Scope.REQUEST })
@@ -169,7 +197,7 @@ CurrentUser (REQUEST) → OrdersService (now REQUEST) → OrdersController (now 
 
 ---
 
-## 9. AsyncLocalStorage — per-request context without the cost
+## 10. AsyncLocalStorage — per-request context without the cost
 
 The usual need (a correlation ID readable everywhere) is better solved with ALS: per-request data while **every service stays a singleton**.
 
@@ -195,7 +223,7 @@ export class AuditLogger {
 
 ---
 
-## 10. Decision frame
+## 11. Decision frame
 
 | Need | Use | Why |
 |------|-----|-----|
@@ -211,6 +239,6 @@ export class AuditLogger {
 ## Connects to
 
 - **async note** — request interleaving (`await` = yield point) is *why* the singleton leak happens and why ALS is safe.
-- **Topic 3 (request pipeline)** — guards/interceptors/pipes run per-request; where `contextMiddleware` and ALS setup live.
+- **Topic 3 (request pipeline)** — guards/interceptors/pipes run per-request; where `contextMiddleware` and ALS setup live. The container-vs-bootstrap fork (§6) is exactly the `APP_GUARD` provider vs `app.useGlobalGuards()` tension.
 - **Topic 4 (observability)** — ALS carries the correlation ID into every log line and across service calls.
 - **Topic 5 (config)** — `forRootAsync` + `useFactory` build clients/connections from validated config.

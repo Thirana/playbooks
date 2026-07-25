@@ -1,8 +1,8 @@
 # NestJS Request Pipeline & Cross-Cutting Concerns (Reference Note)
 
-> Which stage owns which concern, and how to wire them. Built bottom-up — each section assumes the one above. Long-form lessons: `03a-pipeline-map.md`, `03b-interceptors-validation.md`.
+> Which stage owns which concern, and how to wire them. Built bottom-up — each section assumes the one above. Long-form lessons: `01-pipeline-map.md`, `02-interceptors-validation.md`, `03-binding-scopes.md`.
 >
-> **The build:** cross-cutting concerns → the ordered stages → why that order → `ExecutionContext` → interceptors + RxJS → validation → wiring (both transports, `APP_*`).
+> **The build:** cross-cutting concerns → the ordered stages → why that order → `ExecutionContext` → interceptors + RxJS → validation → cross-transport context → binding scope (method/controller/global + `APP_*`).
 
 ---
 
@@ -14,6 +14,7 @@
 - **`ExecutionContext` = "the current invocation, transport-agnostic."** Write components against it → they work for HTTP *and* RabbitMQ.
 - **An interceptor is `before → next.handle() → .pipe(operators)`** — the only stage that wraps *both* sides, which is why it needs an Observable.
 - **Middleware is HTTP-only.** Anything that must also run for RabbitMQ = interceptor.
+- **Two independent axes.** *Injection scope* (DEFAULT/REQUEST/TRANSIENT) = how many instances exist; *binding scope* (method/controller/global) = how many routes one component covers. A component has both (see §7).
 
 ---
 
@@ -159,13 +160,25 @@ export class ContextInterceptor implements NestInterceptor {
 
 ---
 
-## 7. Binding globally *and* keeping DI
+## 7. Binding scope & the `APP_*` tokens
+
+**Binding scope = breadth.** Same decorator, higher placement widens the reach — nothing about the component's code changes:
 
 ```ts
-// ❌ global but NOT injectable — you built it with `new`
-app.useGlobalInterceptors(new LoggingInterceptor());
+@Delete(':id') @UseGuards(AuthGuard) remove() {}   // method — one handler
+@Controller('orders') @UseGuards(AuthGuard)         // controller — every handler in it
+// global — every route in the app (two ways, below)
+```
 
-// ✅ global AND injectable
+Same three levels for the other stages: `@UseInterceptors` / `@UsePipes` / `@UseFilters`.
+
+### Global two ways — and why the token form wins
+
+```ts
+// ❌ global but NOT injectable — you hand-`new` it, outside the container (no DI, no scope)
+app.useGlobalGuards(new AuthGuard());
+
+// ✅ global AND full DI — Nest builds it through the container
 @Module({
   providers: [
     { provide: APP_INTERCEPTOR, useClass: ContextInterceptor },  // registered first = outermost
@@ -177,6 +190,41 @@ app.useGlobalInterceptors(new LoggingInterceptor());
 })
 export class AppModule {}
 ```
+
+Both are global; only the token form gets constructor injection. Prefer it whenever the component has deps (almost always). All four tokens come from `@nestjs/core`.
+
+### Three properties that fall out of DI registration
+
+- **Can be request-scoped:** `{ provide: APP_GUARD, useClass: X, scope: Scope.REQUEST }` — impossible with one hand-`new`ed instance (scope-contagion caveat still applies).
+- **Global even from a feature module:** an `APP_*` provider declared inside `AuthModule` still covers the *whole app* — Nest lifts these tokens to global. Put them where their deps live.
+- **Multi-binding:** register several providers on the same `APP_*` token and *all* run (stack auth + rate-limit guards), unlike normal last-wins tokens.
+
+### Global-by-default, opt out per route
+
+No "un-use" decorator — the always-running component reads route **metadata** and skips itself:
+
+```ts
+export const Public = () => SetMetadata(IS_PUBLIC_KEY, true);   // the marker
+
+// inside the global guard:
+const isPublic = this.reflector.getAllAndOverride(IS_PUBLIC_KEY, [
+  ctx.getHandler(), ctx.getClass(),   // method wins over controller
+]);
+if (isPublic) return true;            // opt-out hit — skip, don't un-bind
+```
+
+Inverts the default to *protect everything, mark exceptions* — forget the marker and a route stays **protected**. Same idiom for interceptors (`@NoLog()`) and filters. **Pipes are the exception:** a global `ValidationPipe` opts out per-DTO/property via `class-validator`, not per-route metadata (a pipe sees the arg, not the route).
+
+### Ordering across levels
+
+- **Incoming: broad → narrow** — global → controller → method. For guards and pipes that's the whole story.
+- **Interceptors also run outgoing, in reverse** — method → controller → global; the outermost (global) starts first, so it *closes last*.
+
+### Middleware sits apart
+
+No `APP_MIDDLEWARE` token — it predates the Nest context. Register functionally with `app.use(...)` (no DI) or as a class via a module's `configure(consumer)` + `consumer.apply(X).forRoutes(...)` (full DI). Needing route metadata or DI is your signal to use a guard/interceptor instead.
+
+> **Mental model:** binding scope (method/controller/global) and injection scope (DEFAULT/REQUEST/TRANSIENT) are independent — e.g. a `Scope.REQUEST` guard bound via `APP_GUARD`. Prefer `APP_*` tokens for globals so you keep DI; use metadata markers to punch per-route holes.
 
 ---
 
@@ -191,8 +239,10 @@ export class AppModule {}
 | Error handling specific to one wrapper | Interceptor `catchError` |
 | Per-request context for HTTP **and** RabbitMQ | **Interceptor** (middleware is HTTP-only) |
 | Global component that injects deps | `APP_*` provider token |
+| Bind to one route / one controller / whole app | `@Use*` on method / on class / `APP_*` token |
+| Global guard, but skip a few routes | metadata marker (`@Public()`) + `Reflector` inside the guard |
 
-> **Rules:** yes/no → guard, wrap/transform → interceptor · validate at the pipe boundary so handlers stay pure · errors are the filter's job by default · cross-transport → interceptor, not middleware · bind globals via `APP_*` to keep DI.
+> **Rules:** yes/no → guard, wrap/transform → interceptor · validate at the pipe boundary so handlers stay pure · errors are the filter's job by default · cross-transport → interceptor, not middleware · bind globals via `APP_*` to keep DI · widen reach by *placement* (method → controller → global), punch holes with metadata markers.
 
 ---
 
@@ -200,5 +250,5 @@ export class AppModule {}
 
 - **error-handling note** — filters are the last pipeline stage; the global error→response policy.
 - **async note** — interceptor `timeout` vs `AbortSignal` cancellation (bound the wait ≠ stop the work).
-- **Topic 2 (DI & scopes)** — `APP_*` tokens make globals injectable; ALS store set up here, read by singletons.
+- **Topic 2 (DI & scopes)** — `APP_*` tokens make globals injectable; binding scope (§7) is a separate axis from injection scope; ALS store set up here, read by singletons.
 - **Topic 4 (observability)** — `ContextInterceptor`'s correlation ID is what every log line and downstream call carries.
